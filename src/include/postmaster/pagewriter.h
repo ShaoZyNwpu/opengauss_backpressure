@@ -154,6 +154,9 @@ extern uint64 get_dirty_page_queue_rec_lsn();
 extern XLogRecPtr ckpt_get_min_rec_lsn(void);
 extern uint64 get_loc_for_lsn(XLogRecPtr target_lsn);
 extern uint64 get_time_ms();
+extern long getPidOutput(double producer_v, double max_consumer_v);
+extern void adapt_create_dirty_page_rate();
+
 extern void incr_buffer_heat(BufferDesc *buf_desc);
 extern uint32 get_buffer_heat(BufferDesc *buf_desc);
 const int PAGEWRITER_VIEW_COL_NUM = 8;

@@ -710,7 +710,7 @@ static BufferDesc* get_buf_from_candidate_list(BufferAccessStrategy strategy, ui
     BufferDesc* buf = NULL;
     uint32 local_buf_state;
     int buf_id = 0;
-    int list_num = g_instance.ckpt_cxt_ctl->pgwr_procs.sub_num;
+    int list_num = g_instance.ckpt_cxt_ctl->pgwr_procs.sub_num - 1;
     int list_id = 0;
     volatile PgBackendStatus* beentry = t_thrd.shemem_ptr_cxt.MyBEEntry;
     Buffer *candidate_dirty_list = NULL;

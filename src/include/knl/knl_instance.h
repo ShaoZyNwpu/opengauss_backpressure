@@ -493,6 +493,13 @@ typedef struct knl_g_ckpt_context {
     volatile uint32 page_writer_last_flush;
     volatile uint32 page_writer_last_queue_flush;
     volatile uint32 create_dirty_page_num; //szy改动，记录每次main_loop产生的脏页数
+    volatile uint64 producer_speed;
+    volatile uint64 consumer_speed;
+    volatile long push_pending_flush_queue_sleep;
+    volatile long pow_count;
+    volatile double last_pc_rate;
+    volatile double last_pid_error;
+    volatile uint64 last_time;
     Buffer *candidate_buffers;
     bool *candidate_free_map;
 

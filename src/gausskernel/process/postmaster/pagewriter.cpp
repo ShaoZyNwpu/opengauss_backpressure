@@ -44,6 +44,7 @@
 #include "gssignal/gs_signal.h"
 #include "gstrace/gstrace_infra.h"
 #include "gstrace/postmaster_gstrace.h"
+#include "math.h"
 
 #define MIN(A, B) ((B) < (A) ? (B) : (A))
 #define MAX(A, B) ((B) > (A) ? (B) : (A))
@@ -96,6 +97,78 @@ static int64 get_thread_candidate_nums(int thread_id);
 static int64 get_thread_seg_candidate_nums(int thread_id);
 
 const int XLOG_LSN_SWAP = 32;
+
+long getPidOutput(double producer_v, double max_consumer_v){
+    // static double kp = 0.8, ki = 0.1, Kd = 0.02;
+    static double Kp = 0.5, Ki = 0.2, Kd = 0.02;
+
+    double pid_error = max_consumer_v - producer_v;
+    double pid_delta_error = pid_error - g_instance.ckpt_cxt_ctl->last_pid_error;
+
+    uint64 current_time = get_time_ms();
+    uint64 delta_time = current_time - g_instance.ckpt_cxt_ctl->last_time;
+
+    static double I_max_modify = 20.0;
+    static double ITerm = 0;
+    ITerm += pid_error * (double)pid_delta_error;
+    if (ITerm < -I_max_modify) {
+        ITerm = -I_max_modify;
+    } else if (ITerm > I_max_modify) {
+        ITerm = I_max_modify;
+    }
+
+    double DTerm = pid_delta_error;
+
+    g_instance.ckpt_cxt_ctl->last_time = current_time;
+    g_instance.ckpt_cxt_ctl->last_pid_error = pid_error;
+    
+    return (long)(Kp * pid_error + Ki * ITerm + Kd * DTerm);
+}
+
+void adapt_create_dirty_page_rate()
+{
+    long adapt_period = 5000000;
+    double sleep_upper_limit = 4000;
+    double producer_v = g_instance.ckpt_cxt_ctl->producer_speed;
+    double max_consumer_v = 40000; //arm
+    // double max_consumer_v = 150000; //X86
+
+    uint32 max_candidate_slots = g_instance.attr.attr_storage.NBuffers;
+    double y1 = 2.5, x1 = 0;
+    double alpha = 2;
+    double max_sleep_range = exp(MAX(0, y1 - x1 - alpha * (x1 - 1) * (y1 - 1) - 1)) - 1;
+
+    uint32 curr_candidate_slots = get_curr_candidate_nums(false);
+    curr_candidate_slots = (curr_candidate_slots > max_candidate_slots) ? max_candidate_slots : curr_candidate_slots;
+    double x = (double)curr_candidate_slots / (double)(max_candidate_slots);
+    double new_max_consumer_v = 0.5 * max_consumer_v + 2.5 * max_consumer_v * x;
+
+    double y = producer_v / max_consumer_v;
+    // 计算sleep_range
+    double sleep_range = exp(MAX(0, y - x - alpha * (x - 1) * (y - 1) - 1)) - 1;
+    // 计算sleep_ratio
+    double sleep_ratio = (sleep_range / max_sleep_range > 1) ? 1 : (sleep_range / max_sleep_range);
+    
+    long a = 1;
+    long b = 0;
+
+    if (x <= 0.2 && y < 1.35) {
+        a = 0;
+        b = 1;
+    }
+    long pid_output = getPidOutput(producer_v, new_max_consumer_v);
+    long pid_sleep_time = MAX(0, MIN(sleep_upper_limit, g_instance.ckpt_cxt_ctl->push_pending_flush_queue_sleep - pid_output *  sleep_upper_limit / new_max_consumer_v));
+    g_instance.ckpt_cxt_ctl->push_pending_flush_queue_sleep = a * (long)(sleep_upper_limit) / (2 * sleep_ratio) + b * pid_sleep_time;
+
+    ereport(LOG,
+            (errmodule(MOD_INCRE_CKPT),
+                errmsg("adapt log, x: %f, y: %f, sleep ratio: %f, pid sleep time: %ld, a: %ld",
+                                              x, y, sleep_ratio, pid_sleep_time, a
+                                             )));
+
+    pg_usleep(adapt_period);
+}
+
 Datum ckpt_view_get_node_name()
 {
     if (g_instance.attr.attr_common.PGXCNodeName == NULL || g_instance.attr.attr_common.PGXCNodeName[0] == '\0') {
@@ -300,10 +373,10 @@ void incre_ckpt_pagewriter_cxt_init()
     g_instance.ckpt_cxt_ctl->CkptBufferIdsCompletedPages = 0;
     g_instance.ckpt_cxt_ctl->page_writer_sub_can_exit = false;
 
-    uint32 dirty_list_size = MAX_DIRTY_LIST_FLUSH_NUM / thread_num;
+    uint32 dirty_list_size = MAX_DIRTY_LIST_FLUSH_NUM / (thread_num - 1);
 
     /* init thread dw cxt  and dirty list */
-    for (int i = 0; i < thread_num; i++) {
+    for (int i = 0; i < thread_num - 1; i++) {
         PageWriterProc *pgwr = &g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[i];
         char *unaligned_buf = (char*)palloc0((DW_BUF_MAX_FOR_NOHBK + 1) * BLCKSZ);
         pgwr->thrd_dw_cxt.dw_buf = (char*)TYPEALIGN(BLCKSZ, unaligned_buf);
@@ -351,7 +424,7 @@ void candidate_buf_init(void)
 
 static void init_candidate_list()
 {
-    int thread_num = g_instance.ckpt_cxt_ctl->pgwr_procs.sub_num;
+    int thread_num = g_instance.ckpt_cxt_ctl->pgwr_procs.sub_num - 1;
     int normal_avg_num = SharedBufferNumber / thread_num;
     int seg_avr_num = SEGMENT_BUFFER_NUM / thread_num;
     PageWriterProc *pgwr = NULL;
@@ -478,6 +551,8 @@ bool push_pending_flush_queue(Buffer buffer)
     XLogRecPtr queue_head_lsn = InvalidXLogRecPtr;
     BufferDesc* buf_desc = GetBufferDescriptor(buffer - 1);
     bool push_finish = false;
+
+    pg_usleep(g_instance.ckpt_cxt_ctl->push_pending_flush_queue_sleep);
 
     Assert(XLogRecPtrIsInvalid(pg_atomic_read_u64(&buf_desc->rec_lsn)));
 #if defined(__x86_64__) || defined(__aarch64__)
@@ -674,9 +749,15 @@ static void wakeup_sub_thread()
         pgwr->need_flush_num = 0;
 
         if (pgwr->proc != NULL) {
-            (void)pg_atomic_add_fetch_u32(&g_instance.ckpt_cxt_ctl->pgwr_procs.running_num, 1);
+            if(thread_loc != g_instance.ckpt_cxt_ctl->pgwr_procs.num - 1){
+                (void)pg_atomic_add_fetch_u32(&g_instance.ckpt_cxt_ctl->pgwr_procs.running_num, 1);
+            }
             pg_write_barrier();
             g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[thread_loc].need_flush = true;
+            if(thread_loc == g_instance.ckpt_cxt_ctl->pgwr_procs.num - 1){
+                g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[thread_loc].need_flush = false;
+                // g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[thread_loc].will_shutdown = false;
+            }
             pg_write_barrier();
             SetLatch(&(pgwr->proc->procLatch));
         }
@@ -1408,6 +1489,9 @@ static void ckpt_pagewriter_sub_thread_loop()
     ResetLatch(&t_thrd.proc->procLatch);
     PageWriterProc* pgwr = &g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[thread_id];
 
+    if(thread_id == g_instance.attr.attr_storage.pagewriter_thread_num){
+        adapt_create_dirty_page_rate();
+    }
     if (pgwr->need_flush) {
         /* scan buffer pool, get flush list and candidate list */
         now = get_time_ms();
@@ -1736,49 +1820,60 @@ void ckpt_pagewriter_main(void)
                 && t_thrd.proc->workingVersionNum >= DW_SUPPORT_REABLE_DOUBLE_WRITE) {
                 dw_upgrade_renable_double_write();
             }
-            uint64 begin_time = get_time_ms();
-            g_instance.ckpt_cxt_ctl->create_dirty_page_num = 0;
-            ckpt_pagewriter_main_thread_loop();
-            uint64 end_time = get_time_ms();
-            uint64 time_diff = end_time - begin_time ;
-            auto avg_heat = g_instance.ckpt_cxt_ctl->flush_total == 0 ? 0 : g_instance.ckpt_cxt_ctl->heat_total/g_instance.ckpt_cxt_ctl->flush_total;
-            double create_dirty_page_num_per_second= time_diff == 0 ? 0 : (double)g_instance.ckpt_cxt_ctl->create_dirty_page_num/(time_diff/1000.0);
-            double page_writer_last_flush_per_second= time_diff == 0 ? 0 : (double)g_instance.ckpt_cxt_ctl->page_writer_last_flush/(time_diff/1000.0);
-            
-            // g_instance.ckpt_cxt_ctl->create_dirty_page_num_sleep_vec.push_back(create_dirty_page_num_per_second);
-            
-            // long blk_hit = u_sess->instr_cxt.pg_buffer_usage->shared_blks_hit; //在缓存中命中块的数量
-            // long blk_read = u_sess->instr_cxt.pg_buffer_usage->shared_blks_read; //没命中的块数量
-            // double hit_radio = blk_hit / (blk_hit + blk_read + 0.001); //平均的缓存命中率
 
-            // 打印日志
-            // ereport(LOG,
-            //         (errmodule(MOD_INCRE_CKPT),
-            //             errmsg("time_diff: %lu,\n"
-            //                     "blk_hit: %ld,\n"
-            //                     "blk_read: %ld,\n"
-            //                     "hit_radio: %f,\n"
-            //                     "avg_heat: %lu,\n"
-            //                     "flush_total: %lu,\n" 
-            //                     "heat_total: %lu,\n"            
-            //                     "create_dirty_page_num: %lu,\n"
-            //                     "create_dirty_page_num_per_second: %f,\n" 
-            //                     "flush_dirty_page_num(page_writer_last_flush): %lu,\n"
-            //                     "flush_dirty_page_num_per_second(page_writer_last_flush_per_second): %f\n",
-            //             time_diff,
-            //             blk_hit,
-            //             blk_read,
-            //             hit_radio,
-            //             avg_heat,
-            //             g_instance.ckpt_cxt_ctl->heat_total,
-            //             g_instance.ckpt_cxt_ctl->flush_total,
-            //             g_instance.ckpt_cxt_ctl->create_dirty_page_num,
-            //             create_dirty_page_num_per_second,
-            //             g_instance.ckpt_cxt_ctl->page_writer_last_flush,
-            //             page_writer_last_flush_per_second
-            //             )));
-            // g_instance.ckpt_cxt_ctl->heat_total = 0;
-            // g_instance.ckpt_cxt_ctl->flush_total = 0;
+            bool blog = (g_instance.ckpt_cxt_ctl->create_dirty_page_num != 0);
+            uint64 begin_time = 0;
+            if(blog){
+                begin_time = get_time_ms();
+                g_instance.ckpt_cxt_ctl->create_dirty_page_num = 0;
+            }
+
+            ckpt_pagewriter_main_thread_loop();
+
+            if(blog){
+                uint64 end_time = get_time_ms();
+                uint64 time_diff = end_time - begin_time;
+                auto avg_heat = g_instance.ckpt_cxt_ctl->flush_total == 0 ? 0 : g_instance.ckpt_cxt_ctl->heat_total/g_instance.ckpt_cxt_ctl->flush_total;
+                double create_dirty_page_num_per_second= time_diff == 0 ? 0 : (double)g_instance.ckpt_cxt_ctl->create_dirty_page_num/(time_diff/1000.0);
+                g_instance.ckpt_cxt_ctl->producer_speed = create_dirty_page_num_per_second;
+                double page_writer_last_flush_per_second= time_diff == 0 ? 0 : (double)g_instance.ckpt_cxt_ctl->page_writer_last_flush/(time_diff/1000.0);
+                g_instance.ckpt_cxt_ctl->consumer_speed = page_writer_last_flush_per_second;
+                // g_instance.ckpt_cxt_ctl->create_dirty_page_num_sleep_vec.push_back(create_dirty_page_num_per_second);
+                
+                long blk_hit = u_sess->instr_cxt.pg_buffer_usage->shared_blks_hit; //在缓存中命中块的数量
+                long blk_read = u_sess->instr_cxt.pg_buffer_usage->shared_blks_read; //没命中的块数量
+                double hit_radio = blk_hit / (blk_hit + blk_read + 0.001); //平均的缓存命中率
+
+                // 打印日志
+                ereport(LOG,
+                        (errmodule(MOD_INCRE_CKPT),
+                            errmsg("time_diff: %lu,\n"
+                                    "blk_hit: %ld,\n"
+                                    "blk_read: %ld,\n"
+                                    "hit_radio: %f,\n"
+                                    "avg_heat: %lu,\n"
+                                    "flush_total: %lu,\n" 
+                                    "heat_total: %lu,\n"            
+                                    "create_dirty_page_num: %lu,\n"
+                                    "create_dirty_page_num_per_second: %f,\n" 
+                                    "flush_dirty_page_num(page_writer_last_flush): %lu,\n"
+                                    "flush_dirty_page_num_per_second(page_writer_last_flush_per_second): %f\n",
+                            time_diff,
+                            blk_hit,
+                            blk_read,
+                            hit_radio,
+                            avg_heat,
+                            g_instance.ckpt_cxt_ctl->heat_total,
+                            g_instance.ckpt_cxt_ctl->flush_total,
+                            g_instance.ckpt_cxt_ctl->create_dirty_page_num,
+                            create_dirty_page_num_per_second,
+                            g_instance.ckpt_cxt_ctl->page_writer_last_flush,
+                            page_writer_last_flush_per_second
+                            )));
+                g_instance.ckpt_cxt_ctl->heat_total = 0;
+                g_instance.ckpt_cxt_ctl->flush_total = 0;
+            }
+            
         } else {
             ckpt_pagewriter_sub_thread_loop();
         }
@@ -2151,7 +2246,7 @@ static bool check_buffer_dirty_flag(BufferDesc* buf_desc)
 
 static uint32 get_list_flush_max_num(bool is_segment)
 {
-    int thread_num = g_instance.ckpt_cxt_ctl->pgwr_procs.sub_num;
+    int thread_num = g_instance.ckpt_cxt_ctl->pgwr_procs.sub_num - 1;
     uint32 max_io = g_instance.ckpt_cxt_ctl->pgwr_procs.list_flush_max / thread_num;
     uint32 dirty_list_size = MAX_DIRTY_LIST_FLUSH_NUM / thread_num;
 
@@ -2522,7 +2617,7 @@ uint32 get_curr_candidate_nums(bool segment)
     PageWriterProc *pgwr = NULL;
 
     if (segment) {
-        for (int i = 1; i < g_instance.ckpt_cxt_ctl->pgwr_procs.num; i++) {
+        for (int i = 1; i < g_instance.ckpt_cxt_ctl->pgwr_procs.num - 1; i++) {
             pgwr = &g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[i];
             if (pgwr->proc != NULL) {
                 currCandidates += get_thread_seg_candidate_nums(i);
@@ -2531,7 +2626,7 @@ uint32 get_curr_candidate_nums(bool segment)
         return currCandidates;
     }
 
-    for (int i = 1; i < g_instance.ckpt_cxt_ctl->pgwr_procs.num; i++) {
+    for (int i = 1; i < g_instance.ckpt_cxt_ctl->pgwr_procs.num - 1; i++) {
         pgwr = &g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[i];
         if (pgwr->proc != NULL) {
             currCandidates += get_thread_candidate_nums(i);
