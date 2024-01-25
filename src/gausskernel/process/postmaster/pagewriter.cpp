@@ -98,6 +98,23 @@ static int64 get_thread_seg_candidate_nums(int thread_id);
 
 const int XLOG_LSN_SWAP = 32;
 
+double cal_average_producer_velocity() {
+    double averageVelocity = 0;
+
+    if (g_instance.ckpt_cxt_ctl->producer_speed_count > 0) {
+        // 取平均
+        uint32 totalVelocity = 0;
+        for (int i = 0; i < g_instance.ckpt_cxt_ctl->producer_speed_count; ++i) {
+            totalVelocity += g_instance.ckpt_cxt_ctl->producer_speed_array[i];
+        }
+        averageVelocity = totalVelocity / (double)(g_instance.ckpt_cxt_ctl->producer_speed_count);
+        // 重置计数
+        g_instance.ckpt_cxt_ctl->producer_speed_count = 0;
+    }
+
+    return averageVelocity;
+}
+
 long getPidOutput(double producer_v, double max_consumer_v){
     // static double kp = 0.8, ki = 0.1, Kd = 0.02;
     static double Kp = 0.5, Ki = 0.2, Kd = 0.02;
@@ -129,7 +146,8 @@ void adapt_create_dirty_page_rate()
 {
     long adapt_period = 5000000;
     double sleep_upper_limit = 4000;
-    double producer_v = g_instance.ckpt_cxt_ctl->producer_speed;
+    // double producer_v = g_instance.ckpt_cxt_ctl->producer_speed;
+    double producer_v = cal_average_producer_velocity();
     double max_consumer_v = 40000; //arm
     // double max_consumer_v = 150000; //X86
 
@@ -152,18 +170,28 @@ void adapt_create_dirty_page_rate()
     long a = 1;
     long b = 0;
 
-    if (x <= 0.2 && y < 1.35) {
-        a = 0;
-        b = 1;
+    // if (x <= 0.2 && y < 1.35) {
+    //     a = 0;
+    //     b = 1;
+    // }
+    // long pid_output = getPidOutput(producer_v, new_max_consumer_v);
+    // long pid_sleep_time = MAX(0, MIN(sleep_upper_limit, g_instance.ckpt_cxt_ctl->push_pending_flush_queue_sleep - pid_output *  sleep_upper_limit / new_max_consumer_v));
+    // g_instance.ckpt_cxt_ctl->push_pending_flush_queue_sleep = a * (long)(sleep_upper_limit) / (2 * sleep_ratio) + b * pid_sleep_time;
+    
+    //modified 24.1.24 shaozy
+    static long adjust_limit = 500; //每次调整的幅度上限
+    long pid_output = getPidOutput(g_instance.ckpt_cxt_ctl->push_pending_flush_queue_sleep, (long)(sleep_upper_limit) / (2 * sleep_ratio));
+    if (labs(pid_output) > adjust_limit) {
+        // 确保pid_output的绝对值不超过adjust_limit
+        pid_output = (pid_output > 0) ? adjust_limit : -adjust_limit;
     }
-    long pid_output = getPidOutput(producer_v, new_max_consumer_v);
-    long pid_sleep_time = MAX(0, MIN(sleep_upper_limit, g_instance.ckpt_cxt_ctl->push_pending_flush_queue_sleep - pid_output *  sleep_upper_limit / new_max_consumer_v));
-    g_instance.ckpt_cxt_ctl->push_pending_flush_queue_sleep = a * (long)(sleep_upper_limit) / (2 * sleep_ratio) + b * pid_sleep_time;
+    long pid_sleep_time = MAX(0, MIN(sleep_upper_limit, g_instance.ckpt_cxt_ctl->push_pending_flush_queue_sleep - pid_output));
+    g_instance.ckpt_cxt_ctl->push_pending_flush_queue_sleep = pid_sleep_time;
 
     ereport(LOG,
             (errmodule(MOD_INCRE_CKPT),
-                errmsg("adapt log, x: %f, y: %f, sleep ratio: %f, pid sleep time: %ld, a: %ld",
-                                              x, y, sleep_ratio, pid_sleep_time, a
+                errmsg("adapt log, x: %f, y: %f, target: %f, pid sleep time: %ld, a: %ld",
+                                              x, y,  (long)(sleep_upper_limit) / (2 * sleep_ratio), pid_sleep_time, a
                                              )));
 
     pg_usleep(adapt_period);
@@ -1835,10 +1863,14 @@ void ckpt_pagewriter_main(void)
                 uint64 time_diff = end_time - begin_time;
                 auto avg_heat = g_instance.ckpt_cxt_ctl->flush_total == 0 ? 0 : g_instance.ckpt_cxt_ctl->heat_total/g_instance.ckpt_cxt_ctl->flush_total;
                 double create_dirty_page_num_per_second= time_diff == 0 ? 0 : (double)g_instance.ckpt_cxt_ctl->create_dirty_page_num/(time_diff/1000.0);
-                g_instance.ckpt_cxt_ctl->producer_speed = create_dirty_page_num_per_second;
+                // g_instance.ckpt_cxt_ctl->producer_speed = create_dirty_page_num_per_second;
                 double page_writer_last_flush_per_second= time_diff == 0 ? 0 : (double)g_instance.ckpt_cxt_ctl->page_writer_last_flush/(time_diff/1000.0);
                 g_instance.ckpt_cxt_ctl->consumer_speed = page_writer_last_flush_per_second;
-                // g_instance.ckpt_cxt_ctl->create_dirty_page_num_sleep_vec.push_back(create_dirty_page_num_per_second);
+                
+                // 将速度值添加到数组
+                if (g_instance.ckpt_cxt_ctl->producer_speed_count < MAX_PRODUCER_SPEED_SIZE) {
+                    g_instance.ckpt_cxt_ctl->producer_speed_array[g_instance.ckpt_cxt_ctl->producer_speed_count++] = create_dirty_page_num_per_second;
+                }
                 
                 long blk_hit = u_sess->instr_cxt.pg_buffer_usage->shared_blks_hit; //在缓存中命中块的数量
                 long blk_read = u_sess->instr_cxt.pg_buffer_usage->shared_blks_read; //没命中的块数量
