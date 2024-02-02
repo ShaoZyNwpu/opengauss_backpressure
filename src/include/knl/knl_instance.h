@@ -63,7 +63,6 @@
 #include "streaming/init.h"
 #include "storage/lock/lwlock.h"
 #include "utils/memgroup.h"
-
 #include "replication/walprotocol.h"
 #ifdef ENABLE_MOT
 #include "storage/mot/jit_def.h"
@@ -87,7 +86,7 @@ const uint32 PARALLEL_DECODE_WORKER_EXIT = 3;
 
 /* Maximum number of max replication slots */
 #define MAX_REPLICATION_SLOT_NUM 100
-
+#define MAX_PRODUCER_SPEED_SIZE 100
 #ifndef ENABLE_MULTIPLE_NODES
 const int DB_CMPT_MAX = 4;
 #endif
@@ -493,6 +492,16 @@ typedef struct knl_g_ckpt_context {
     PageWriterProcs pgwr_procs;
     volatile uint32 page_writer_last_flush;
     volatile uint32 page_writer_last_queue_flush;
+    volatile uint32 create_dirty_page_num; //szy改动，记录每次main_loop产生的脏页数
+    volatile uint64 producer_speed_array[MAX_PRODUCER_SPEED_SIZE];
+    int producer_speed_count;
+    volatile uint64 producer_speed; 
+    volatile uint64 consumer_speed;
+    volatile long push_pending_flush_queue_sleep;
+    volatile long pow_count;
+    volatile double last_pc_rate;
+    volatile double last_pid_error;
+    volatile uint64 last_time;
     Buffer *candidate_buffers;
     bool *candidate_free_map;
 
@@ -524,6 +533,9 @@ typedef struct knl_g_ckpt_context {
 #endif
 
     struct IncreCkptSyncShmemStruct* incre_ckpt_sync_shmem;
+
+    uint64 flush_total;
+    uint64 heat_total;
 
     uint64 pad[TWO_UINT64_SLOT];
 } knl_g_ckpt_context;

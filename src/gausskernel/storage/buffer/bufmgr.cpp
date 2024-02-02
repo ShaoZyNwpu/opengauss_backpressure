@@ -2159,6 +2159,14 @@ static Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumb
             u_sess->instr_cxt.pg_buffer_usage->shared_blks_read++;
             pgstatCountSharedBlocksRead4SessionLevel();
         }
+
+        // ereport(LOG,
+        //             (errmodule(MOD_INCRE_CKPT),
+        //                 errmsg("blk_hit: %ld,\n"
+        //                         "blk_read: %ld,\n",
+        //                 u_sess->instr_cxt.pg_buffer_usage->shared_blks_hit,
+        //                 u_sess->instr_cxt.pg_buffer_usage->shared_blks_read
+        //                 )));
     }
 
     /* At this point we do NOT hold any locks.
@@ -2374,6 +2382,7 @@ void SimpleMarkBufDirty(BufferDesc *buf)
             pg_usleep(TEN_MICROSECOND);
             oldBufState = LockBufHdr(buf);
         }
+        incr_buffer_heat(buf);
     }
     UnlockBufHdr(buf, bufState);
 
@@ -2981,6 +2990,7 @@ void MarkBufferDirty(Buffer buffer)
             pg_usleep(TEN_MICROSECOND);
             old_buf_state = LockBufHdr(buf_desc);
         }
+        incr_buffer_heat(buf_desc);
     }
 
     UnlockBufHdr(buf_desc, buf_state);
@@ -5466,6 +5476,7 @@ void MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
                 pg_usleep(TEN_MICROSECOND);
                 old_buf_state = LockBufHdr(buf_desc);
             }
+            incr_buffer_heat(buf_desc);
         }
 
         UnlockBufHdr(buf_desc, buf_state);
